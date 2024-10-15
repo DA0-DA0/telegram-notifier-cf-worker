@@ -1,0 +1,14 @@
+name = "telegram-notifier"
+main = "src/index.ts"
+compatibility_date = "2024-10-14"
+node_compat = true
+
+[[ d1_databases ]]
+binding = "DB"
+database_name = "telegram-notifier"
+database_id = "<REPLACE DB_ID>"
+
+# Secrets:
+# - BOT_TOKEN
+# - WEBHOOK_SECRET
+# - NOTIFY_API_KEY
