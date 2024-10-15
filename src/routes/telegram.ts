@@ -9,6 +9,7 @@ import {
 } from '../utils'
 
 type TelegramUser = {
+  id: number
   username: string
 }
 
@@ -16,12 +17,14 @@ type TelegramChat = {
   // negative for groups
   id: number
   type: 'private' | 'group' | 'supergroup' | 'channel'
-  text: string
+  title: string
   // if the chat is a supergroup AND has forum topics enabled
   is_forum?: boolean
 }
 
-type TelegramChatMember =
+type TelegramChatMember = {
+  user: TelegramUser
+} & (
   | {
       status: 'member' | 'administrator' | 'creator' | 'left' | 'kicked'
     }
@@ -29,6 +32,7 @@ type TelegramChatMember =
       status: 'restricted'
       can_send_messages: boolean
     }
+)
 
 type TelegramMessage = {
   // will be defined if sent in a forum topic
@@ -178,6 +182,34 @@ export const telegram = async (
     ) {
       chatId = data.message.chat.id
       messageThreadId = data.message.message_thread_id ?? undefined
+
+      // if not a private chat, verify that sender is admin or owner.
+      if (data.message.chat.type !== 'private') {
+        const admins = await fetch(
+          `https://api.telegram.org/bot${env.BOT_TOKEN}/getChatAdministrators?chat_id=${chatId}`
+        )
+          .then((r) =>
+            r.json<{
+              ok: boolean
+              result: TelegramChatMember[]
+            }>()
+          )
+          .catch(() => ({ ok: false, result: [] }))
+
+        const isAdmin =
+          !!admins.ok &&
+          admins.result.some(
+            (admin) =>
+              admin.user.id === data.message.from.id &&
+              (admin.status === 'administrator' || admin.status === 'creator')
+          )
+
+        // Do nothing if not admin. Sending an error message means non-admins
+        // could spam the chat with error messages.
+        if (!isAdmin) {
+          return respond(200)
+        }
+      }
 
       if (data.message.text.startsWith('/start')) {
         return respondMarkdown(
