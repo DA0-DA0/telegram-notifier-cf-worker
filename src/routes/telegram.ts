@@ -18,8 +18,6 @@ type TelegramChat = {
   id: number
   type: 'private' | 'group' | 'supergroup' | 'channel'
   title: string
-  // if the chat is a supergroup AND has forum topics enabled
-  is_forum?: boolean
 }
 
 type TelegramChatMember = {
@@ -39,7 +37,7 @@ type TelegramMessage = {
   message_thread_id?: number
   chat: TelegramChat
   from: TelegramUser
-  text?: string
+  text: string
   reply_to_message?: TelegramMessage
 }
 
@@ -61,13 +59,13 @@ type TelegramWebhookData = {
   }
 }
 
-const WELCOME_GROUP_MESSAGE = `Hello\\! I'll send a message when there are new proposals in DAOs you track\\. Use the following command to start tracking a DAO:\n\n\`/add@dao\\_dao\\_notifier\\_bot DAO\\_ADDRESS\``
-
-const WELCOME_FORUM_MESSAGE = `Hello\\! I'll send a message when there are new proposals in DAOs you track\\. Use the following command in any topic thread to start tracking a DAO:\n\n\`/add@dao\\_dao\\_notifier\\_bot DAO\\_ADDRESS\``
-
-const WELCOME_PRIVATE_MESSAGE = `Hello\\! I'll send a message when there are new proposals in DAOs you track\\. You can add me to group chats to track proposals with others, or just use me in private\\.\n\nUse the following command to start tracking a DAO in this chat:\n\n\`/add@dao\\_dao\\_notifier\\_bot DAO\\_ADDRESS\``
-
 const BOT_USERNAME = 'dao_dao_notifier_bot'
+const REPLY_ADD_INSTRUCTIONS =
+  "Reply to this message with the DAO's address or a link to its page to start tracking it."
+const REPLY_REMOVE_INSTRUCTIONS =
+  "Reply to this message with the DAO's address or a link to its page to stop tracking it."
+
+const NO_RESPONSE = respond(200)
 
 export const telegram = async (
   request: IttyRequest & Request,
@@ -80,31 +78,53 @@ export const telegram = async (
 
   const data: TelegramWebhookData = await request.json?.()
 
-  let chatId: number | undefined
-  let messageThreadId: number | undefined
+  const isBotMembershipChange = objectMatchesStructure(data, {
+    my_chat_member: {
+      chat: {
+        id: {},
+      },
+      old_chat_member: {
+        status: {},
+      },
+      new_chat_member: {
+        status: {},
+      },
+    },
+  })
+
+  const isMessage =
+    objectMatchesStructure(data, {
+      message: { chat: { id: {} }, text: {} },
+    }) && !!data.message.text
+
+  const chat = isBotMembershipChange
+    ? data.my_chat_member.chat
+    : isMessage
+    ? data.message.chat
+    : undefined
+
+  if (!chat) {
+    console.error('chat is undefined. cannot respond to this request')
+    return NO_RESPONSE
+  }
+
+  // no message thread ID for membership changes
+  const messageThreadId = isMessage
+    ? data.message.message_thread_id ?? undefined
+    : undefined
 
   const respondPlain = (text: string) => {
-    if (chatId === undefined) {
-      console.error('chatId is undefined. could not send message', text)
-      return respond(200)
-    }
-
     return respond(200, {
       method: 'sendMessage',
-      chat_id: chatId,
+      chat_id: chat.id,
       message_thread_id: messageThreadId,
       text,
     })
   }
   const respondMarkdown = (text: string) => {
-    if (chatId === undefined) {
-      console.error('chatId is undefined. could not send message', text)
-      return respond(200)
-    }
-
     return respond(200, {
       method: 'sendMessage',
-      chat_id: chatId,
+      chat_id: chat.id,
       message_thread_id: messageThreadId,
       parse_mode: 'MarkdownV2',
       text,
@@ -114,79 +134,74 @@ export const telegram = async (
     })
   }
 
+  // in private chats, no need to mention the bot. in groups, commands need to
+  // directly mention the bot to work.
+  const suffix =
+    chat.type === 'private' ? '' : '@' + escapeMarkdownV2(BOT_USERNAME)
+
+  const HELP_TEXT =
+    `Here's how to use me:\n\n` +
+    [
+      `/add${suffix} \\- start tracking a DAO`,
+      `/remove${suffix} \\- stop tracking a DAO`,
+      `/list${suffix} \\- list your tracked DAOs`,
+      `/help${suffix} \\- see this message again`,
+    ].join('\n')
+
+  const WELCOME_GROUP_MESSAGE = `Hello\\! I'll send a message when there are new proposals in DAOs you track\\. ${HELP_TEXT}\n\n_Only admins or owners can use the commands above_\\.`
+
+  const WELCOME_PRIVATE_MESSAGE = `Hello\\! I'll send a message when there are new proposals in DAOs you track\\. You can add me to group chats to track proposals with others, or just use me in private\\. ${HELP_TEXT}`
+
   try {
-    if (
-      objectMatchesStructure(data, {
-        my_chat_member: {
-          chat: {
-            id: {},
-          },
-          old_chat_member: {
-            status: {},
-          },
-          new_chat_member: {
-            status: {},
-          },
-        },
-      })
-    ) {
-      // set chat ID, no message thread ID since this is a membership update
-      // that applies to the whole group, not just a specific thread
-      chatId = data.my_chat_member.chat.id
+    if (isBotMembershipChange) {
+      const { old_chat_member: oldChatMember, new_chat_member: newChatMember } =
+        data.my_chat_member
 
       // if removed from chat, unregister all DAOs for this chat (in any topic)
       if (
-        data.my_chat_member.new_chat_member.status === 'left' ||
-        data.my_chat_member.new_chat_member.status === 'kicked'
+        newChatMember.status === 'left' ||
+        newChatMember.status === 'kicked'
       ) {
         console.log(
-          `removing all registrations for chat ${data.my_chat_member.chat.id} since bot now has ${data.my_chat_member.new_chat_member.status} status`
+          `removing all registrations for chat ${chat.id} since bot now has ${newChatMember.status} status`
         )
 
         await env.DB.prepare('DELETE FROM registrations WHERE chatId = ?1')
-          .bind(BigInt(data.my_chat_member.chat.id).toString())
+          .bind(BigInt(chat.id).toString())
           .run()
       }
       // if bot is restricted and cannot send messages, complain
       else if (
-        data.my_chat_member.new_chat_member.status === 'restricted' &&
-        !data.my_chat_member.new_chat_member.can_send_messages
+        newChatMember.status === 'restricted' &&
+        !newChatMember.can_send_messages
       ) {
         console.log(
-          `bot is restricted and cannot send messages in chat ${data.my_chat_member.chat.id}`
+          `bot is restricted and cannot send messages in chat ${chat.id}`
         )
       }
       // if bot is added to chat, send welcome message
       else if (
-        (data.my_chat_member.old_chat_member.status === 'left' ||
-          data.my_chat_member.old_chat_member.status === 'kicked') &&
-        (data.my_chat_member.new_chat_member.status === 'member' ||
-          data.my_chat_member.new_chat_member.status === 'administrator' ||
-          data.my_chat_member.new_chat_member.status === 'creator')
+        (oldChatMember.status === 'left' ||
+          oldChatMember.status === 'kicked') &&
+        (newChatMember.status === 'member' ||
+          newChatMember.status === 'administrator' ||
+          newChatMember.status === 'creator')
       ) {
-        console.log(`bot is added to chat ${data.my_chat_member.chat.id}`)
+        console.log(`bot is added to chat ${chat.id}`)
 
         return respondMarkdown(
-          data.my_chat_member.chat.type === 'private'
+          chat.type === 'private'
             ? WELCOME_PRIVATE_MESSAGE
-            : data.my_chat_member.chat.is_forum
-            ? WELCOME_FORUM_MESSAGE
             : WELCOME_GROUP_MESSAGE
         )
       }
-    } else if (
-      objectMatchesStructure(data, {
-        message: { chat: { id: {} }, text: {} },
-      }) &&
-      data.message.text
-    ) {
-      chatId = data.message.chat.id
-      messageThreadId = data.message.message_thread_id ?? undefined
+    } else if (isMessage) {
+      const text = data.message.text
 
       // if not a private chat, verify that sender is admin or owner.
-      if (data.message.chat.type !== 'private') {
+      if (chat.type !== 'private') {
         const admins = await fetch(
-          `https://api.telegram.org/bot${env.BOT_TOKEN}/getChatAdministrators?chat_id=${chatId}`
+          `https://api.telegram.org/bot${env.BOT_TOKEN}/getChatAdministrators?chat_id=${chat.id}`
         )
           .then((r) =>
             r.json<{
@@ -207,49 +222,39 @@ export const telegram = async (
         // Do nothing if not admin. Sending an error message means non-admins
         // could spam the chat with error messages.
         if (!isAdmin) {
-          return respond(200)
+          return NO_RESPONSE
         }
       }
 
-      if (data.message.text.startsWith('/start')) {
+      if (text.startsWith('/start')) {
         return respondMarkdown(
-          data.message.chat.type === 'private'
+          chat.type === 'private'
             ? WELCOME_PRIVATE_MESSAGE
-            : data.message.chat.is_forum
-            ? WELCOME_FORUM_MESSAGE
             : WELCOME_GROUP_MESSAGE
         )
       }
 
-      if (data.message.text.startsWith('/help')) {
-        return respondMarkdown(
-          `Here's how to use me:\n\n` +
-            [
-              `– Send \`/add@dao\\_dao\\_notifier\\_bot DAO\\_ADDRESS\` to start tracking a DAO\\.`,
-              `– Send \`/remove@dao\\_dao\\_notifier\\_bot DAO\\_ADDRESS\` to stop tracking a DAO\\.`,
-              `– Send /list@dao\\_dao\\_notifier\\_bot to see all the DAOs you're tracking\\.`,
-              `– Send /help@dao\\_dao\\_notifier\\_bot to get this message\\.`,
-            ].join('\n')
-        )
+      if (text.startsWith('/help')) {
+        return respondMarkdown(HELP_TEXT)
       }
 
-      if (data.message.text.startsWith('/list')) {
+      if (text.startsWith('/list')) {
         const { results: registrations = [] } = await env.DB.prepare(
           `SELECT dao FROM registrations WHERE chatId = ?1 AND messageThreadId ${
-            data.message.message_thread_id !== undefined ? '= ?2' : 'IS NULL'
+            messageThreadId !== undefined ? '= ?2' : 'IS NULL'
           }`
         )
           .bind(
-            BigInt(data.message.chat.id).toString(),
-            ...(data.message.message_thread_id !== undefined
-              ? [BigInt(data.message.message_thread_id).toString()]
+            BigInt(chat.id).toString(),
+            ...(messageThreadId !== undefined
+              ? [BigInt(messageThreadId).toString()]
               : [])
           )
           .all<Pick<RegistrationRow, 'dao'>>()
 
         if (registrations.length === 0) {
           return respondMarkdown(
-            `You're not tracking any DAOs\\.\n\nSend \`/add@dao\\_dao\\_notifier\\_bot DAO\\_ADDRESS\` to start tracking a DAO\\.`
+            `You're not tracking any DAOs\\.\n\nSend /add${suffix} to start tracking a DAO\\.`
           )
         }
 
@@ -269,37 +274,44 @@ export const telegram = async (
         )
       }
 
-      let dao
-      if (
-        data.message.text.startsWith('/add') ||
-        data.message.text.startsWith('/remove')
-      ) {
-        dao = data.message.text.split(' ')[1]?.trim()
-        if (!dao) {
-          return respondPlain(
-            "Reply to this message with the DAO's address or a link to its page."
-          )
-        }
-      } else {
-        // if not in a private chat, only process a non-command message if not
-        // replying to one of this bot's messages. this ensure it doesn't
-        // attempt to respond to all group messages.
-        if (
-          data.message.chat.type !== 'private' &&
-          data.message.reply_to_message?.from.username !== BOT_USERNAME
-        ) {
-          return respond(200)
+      let isAdd = text.startsWith('/add')
+      let isRemove = text.startsWith('/remove')
+
+      // if neither add nor remove command detected, auto-detect based on reply
+      if (!isAdd && !isRemove) {
+        const replyToMessage = data.message.reply_to_message
+
+        if (!replyToMessage || replyToMessage.from.username !== BOT_USERNAME) {
+          return NO_RESPONSE
         }
 
-        dao = data.message.text.match(
+        isAdd =
+          replyToMessage.text.startsWith('/add') ||
+          replyToMessage.text === REPLY_ADD_INSTRUCTIONS
+        isRemove =
+          replyToMessage.text.startsWith('/remove') ||
+          replyToMessage.text === REPLY_REMOVE_INSTRUCTIONS
+
+        if (!isAdd && !isRemove) {
+          return NO_RESPONSE
+        }
+      }
+
+      const dao = text
+        .replace(/^(\/add|\/remove)(@dao_dao_notifier_bot)?\s*/i, '')
+        .match(
           /(?:https:\/\/)?(?:testnet\.)?(?:daodao\.zone\/dao\/)?([a-zA-Z0-9]+)/
         )?.[1]
 
-        if (!dao) {
-          return respondPlain(
-            "I don't recognize the DAO address or link provided. Please try again."
-          )
+      if (!dao) {
+        if (isAdd) {
+          return respondPlain(REPLY_ADD_INSTRUCTIONS)
+        } else if (isRemove) {
+          return respondPlain(REPLY_REMOVE_INSTRUCTIONS)
         }
+
+        // shouldn't happen
+        return NO_RESPONSE
       }
 
       const info = await getDaoInfo(dao)
@@ -307,65 +319,27 @@ export const telegram = async (
       if (info) {
         const existing = await env.DB.prepare(
           `SELECT * FROM registrations WHERE chainId = ?1 AND dao = ?2 AND chatId = ?3 AND messageThreadId ${
-            data.message.message_thread_id !== undefined ? '= ?4' : 'IS NULL'
+            messageThreadId !== undefined ? '= ?4' : 'IS NULL'
           }`
         )
           .bind(
             info.chainId,
             dao,
-            BigInt(data.message.chat.id).toString(),
-            ...(data.message.message_thread_id !== undefined
-              ? [BigInt(data.message.message_thread_id).toString()]
+            BigInt(chat.id).toString(),
+            ...(messageThreadId !== undefined
+              ? [BigInt(messageThreadId).toString()]
               : [])
           )
           .first()
 
-        // remove
-        if (data.message.text.startsWith('/remove@')) {
-          if (existing) {
-            await env.DB.prepare(
-              `DELETE FROM registrations WHERE dao = ?1 AND chatId = ?2 AND messageThreadId ${
-                data.message.message_thread_id !== undefined
-                  ? '= ?3'
-                  : 'IS NULL'
-              }`
-            )
-              .bind(
-                dao,
-                BigInt(data.message.chat.id).toString(),
-                ...(data.message.message_thread_id !== undefined
-                  ? [BigInt(data.message.message_thread_id).toString()]
-                  : [])
-              )
-              .run()
-
-            return respondMarkdown(
-              `Ok, you're no longer tracking [${escapeMarkdownV2(
-                info.value.config.name
-              )}](${
-                info.url
-              })\\.\n\nSend \`/add@dao\\_dao\\_notifier\\_bot ${dao}\` to track it again\\.`
-            )
-          } else {
-            return respondMarkdown(
-              `You're not tracking [${escapeMarkdownV2(
-                info.value.config.name
-              )}](${
-                info.url
-              })\\.\n\nSend \`/add@dao\\_dao\\_notifier\\_bot ${dao}\` to track it\\.`
-            )
-          }
-        }
-
-        // add
-        else {
+        if (isAdd) {
           if (existing) {
             return respondMarkdown(
               `You're already tracking [${escapeMarkdownV2(
                 info.value.config.name
               )}](${
                 info.url
-              })\\! I'll notify you when there are new proposals\\.\n\nSend \`/remove@dao\\_dao\\_notifier\\_bot ${dao}\` to stop tracking it\\.`
+              })\\! I'll notify you when there are new proposals\\.\n\nSend \`/remove${suffix} ${dao}\` to stop tracking it\\.`
             )
           }
 
@@ -375,9 +349,9 @@ export const telegram = async (
             .bind(
               info.chainId,
               dao,
-              BigInt(data.message.chat.id).toString(),
-              data.message.message_thread_id !== undefined
-                ? BigInt(data.message.message_thread_id).toString()
+              BigInt(chat.id).toString(),
+              messageThreadId !== undefined
+                ? BigInt(messageThreadId).toString()
                 : null
             )
             .run()
@@ -387,12 +361,46 @@ export const telegram = async (
               info.value.config.name
             )}](${
               info.url
-            })\\.\n\nSend \`/remove@dao\\_dao\\_notifier\\_bot ${dao}\` to stop tracking it\\.`
+            })\\.\n\nSend \`/remove${suffix} ${dao}\` to stop tracking it\\.`
           )
+        }
+
+        if (isRemove) {
+          if (existing) {
+            await env.DB.prepare(
+              `DELETE FROM registrations WHERE dao = ?1 AND chatId = ?2 AND messageThreadId ${
+                messageThreadId !== undefined ? '= ?3' : 'IS NULL'
+              }`
+            )
+              .bind(
+                dao,
+                BigInt(chat.id).toString(),
+                ...(messageThreadId !== undefined
+                  ? [BigInt(messageThreadId).toString()]
+                  : [])
+              )
+              .run()
+
+            return respondMarkdown(
+              `Ok, you're no longer tracking [${escapeMarkdownV2(
+                info.value.config.name
+              )}](${
+                info.url
+              })\\.\n\nSend \`/add${suffix} ${dao}\` to track it again\\.`
+            )
+          } else {
+            return respondMarkdown(
+              `You're not tracking [${escapeMarkdownV2(
+                info.value.config.name
+              )}](${
+                info.url
+              })\\.\n\nSend \`/add${suffix} ${dao}\` to track it\\.`
+            )
+          }
         }
       } else {
         return respondPlain(
-          "I couldn't find a DAO with that address. Try copying the URL from your browser and using that instead."
+          "I don't recognize the DAO address or link provided. Try replying to the original message with the URL copied from your browser."
         )
       }
     }
@@ -408,5 +416,5 @@ export const telegram = async (
     )
   }
 
-  return respond(200)
+  return NO_RESPONSE
 }
