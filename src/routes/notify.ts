@@ -1,9 +1,12 @@
 import { Request } from 'itty-router'
 import { Env, RegistrationRow } from '../types'
 import { escapeMarkdownV2, respond, respondError } from '../utils'
+import removeMarkdown from 'remove-markdown'
 
 const BATCH_SIZE = 10
 const RETRIES = 3
+
+const MAX_DESCRIPTION_LENGTH = 500
 
 export const notify = async (request: Request, env: Env): Promise<Response> => {
   const { chainId, dao } = request.params ?? {}
@@ -14,7 +17,21 @@ export const notify = async (request: Request, env: Env): Promise<Response> => {
     return respondError(400, 'Missing `dao`.')
   }
 
-  const { apiKey, daoName, proposalId, url } = await request.json?.()
+  const {
+    apiKey,
+    daoName,
+    proposalTitle,
+    proposalDescription,
+    proposalId,
+    daoUrl,
+    url,
+  } = await request.json?.()
+
+  let sanitizedDescription = removeMarkdown(proposalDescription)
+  if (sanitizedDescription.length > MAX_DESCRIPTION_LENGTH) {
+    sanitizedDescription =
+      sanitizedDescription.slice(0, MAX_DESCRIPTION_LENGTH) + '...'
+  }
 
   if (apiKey !== env.NOTIFY_API_KEY) {
     return respondError(401, 'Invalid API key.')
@@ -48,11 +65,18 @@ export const notify = async (request: Request, env: Env): Promise<Response> => {
                     ? Number(messageThreadId)
                     : undefined,
                   parse_mode: 'MarkdownV2',
-                  text: `🎉🎉 [Proposal ${proposalId}](${url}) is open for voting in ${escapeMarkdownV2(
+                  text: `_[Proposal ${escapeMarkdownV2(
+                    proposalId
+                  )}](${url}) is open for voting in [${escapeMarkdownV2(
                     daoName
-                  )} 🎉🎉`,
+                  )}](${daoUrl})\\._\n\n>*${escapeMarkdownV2(
+                    proposalTitle
+                  )}*\n>\n>${escapeMarkdownV2(sanitizedDescription)
+                    .trim()
+                    .split('\n')
+                    .join('\n>')}`,
                   link_preview_options: {
-                    is_disabled: false,
+                    is_disabled: true,
                   },
                 }),
               }
