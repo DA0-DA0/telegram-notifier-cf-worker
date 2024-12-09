@@ -8,6 +8,13 @@ const RETRIES = 3
 
 const MAX_DESCRIPTION_LENGTH = 500
 
+enum NotifyType {
+  ProposalCreated = 'proposal_created',
+  ProposalExecuted = 'proposal_executed',
+  ProposalExecutionFailed = 'proposal_execution_failed',
+  ProposalClosed = 'proposal_closed',
+}
+
 export const notify = async (request: Request, env: Env): Promise<Response> => {
   const { chainId, dao } = request.params ?? {}
   if (!chainId) {
@@ -18,6 +25,7 @@ export const notify = async (request: Request, env: Env): Promise<Response> => {
   }
 
   const {
+    type: _type,
     apiKey,
     daoName,
     proposalTitle,
@@ -25,7 +33,11 @@ export const notify = async (request: Request, env: Env): Promise<Response> => {
     proposalId,
     daoUrl,
     url,
+    winningChoice,
   } = await request.json?.()
+
+  // Backwards compatibility.
+  const type = _type ?? NotifyType.ProposalCreated
 
   let sanitizedDescription = removeMarkdown(proposalDescription)
   if (sanitizedDescription.length > MAX_DESCRIPTION_LENGTH) {
@@ -35,6 +47,65 @@ export const notify = async (request: Request, env: Env): Promise<Response> => {
 
   if (apiKey !== env.NOTIFY_API_KEY) {
     return respondError(401, 'Invalid API key.')
+  }
+
+  const text =
+    type === NotifyType.ProposalCreated
+      ? `_[Proposal ${escapeMarkdownV2(
+          proposalId
+        )}](${url}) is open for voting in [${escapeMarkdownV2(
+          daoName
+        )}](${daoUrl})\\._\n\n>*${escapeMarkdownV2(
+          proposalTitle
+        )}*\n>\n>${escapeMarkdownV2(sanitizedDescription)
+          .trim()
+          .split('\n')
+          .join('\n>')}`
+      : type === NotifyType.ProposalExecuted
+      ? `_[Proposal ${escapeMarkdownV2(
+          proposalId
+        )}](${url}) in [${escapeMarkdownV2(
+          daoName
+        )}](${daoUrl})\\ was passed and executed\\._\n\n>*${escapeMarkdownV2(
+          proposalTitle
+        )}*\n>\n>${escapeMarkdownV2(sanitizedDescription)
+          .trim()
+          .split('\n')
+          .join('\n>')}${
+          winningChoice
+            ? `\n>\n>Outcome: *${escapeMarkdownV2(winningChoice)}*`
+            : ''
+        }`
+      : type === NotifyType.ProposalExecutionFailed
+      ? `_[Proposal ${escapeMarkdownV2(
+          proposalId
+        )}](${url}) in [${escapeMarkdownV2(
+          daoName
+        )}](${daoUrl})\\ was passed but failed to execute\\._\n\n>*${escapeMarkdownV2(
+          proposalTitle
+        )}*\n>\n>${escapeMarkdownV2(sanitizedDescription)
+          .trim()
+          .split('\n')
+          .join('\n>')}${
+          winningChoice
+            ? `\n>\n>Outcome: *${escapeMarkdownV2(winningChoice)}*`
+            : ''
+        }`
+      : type === NotifyType.ProposalClosed
+      ? `_[Proposal ${escapeMarkdownV2(
+          proposalId
+        )}](${url}) in [${escapeMarkdownV2(
+          daoName
+        )}](${daoUrl})\\ was rejected and closed\\._\n\n>*${escapeMarkdownV2(
+          proposalTitle
+        )}*\n>\n>${escapeMarkdownV2(sanitizedDescription)
+          .trim()
+          .split('\n')
+          .join('\n>')}`
+      : ''
+
+  if (!text) {
+    return respondError(400, 'Invalid notification type.')
   }
 
   const { results: registrations = [] } = await env.DB.prepare(
@@ -65,16 +136,7 @@ export const notify = async (request: Request, env: Env): Promise<Response> => {
                     ? Number(messageThreadId)
                     : undefined,
                   parse_mode: 'MarkdownV2',
-                  text: `_[Proposal ${escapeMarkdownV2(
-                    proposalId
-                  )}](${url}) is open for voting in [${escapeMarkdownV2(
-                    daoName
-                  )}](${daoUrl})\\._\n\n>*${escapeMarkdownV2(
-                    proposalTitle
-                  )}*\n>\n>${escapeMarkdownV2(sanitizedDescription)
-                    .trim()
-                    .split('\n')
-                    .join('\n>')}`,
+                  text,
                   link_preview_options: {
                     is_disabled: true,
                   },
