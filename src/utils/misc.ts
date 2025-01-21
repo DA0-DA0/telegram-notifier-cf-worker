@@ -15,7 +15,7 @@ export type DaoInfo = {
 
 export const getDaoInfo = async (dao: string): Promise<DaoInfo | null> => {
   const info = await fetch(
-    `https://snapper.daodao.zone/q/daodao-dao-info?address=${dao}`
+    `https://snapper.indexer.zone/q/daodao-dao-info?address=${dao}`
   )
     .then((r) => r.json())
     .catch(() => null)
